@@ -2,5 +2,9 @@
 name = "cli-pdf-extract"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+pdf_oxide = "*"
