@@ -1,35 +1,46 @@
 # cli-pdf-extract
 
-A fast Rust CLI wrapper around `pdf_oxide` that lets LLMs peek into PDFs without paying the cost of loading and synthesizing whole documents. It extracts page text as Markdown for quick ingestion and can also pull only highlights (plus notes), which is ideal when you want the essence without the full context and need higher LLM throughput.
+`cli-pdf-extract` is a fast Rust CLI for LLM-friendly PDF inspection. It wraps `pdf_oxide` and focuses on practical research workflows: quick triage, targeted extraction, and lightweight downstream parsing.
 
-## Features
+## Why This Tool
 
-- Extract pages as Markdown (single page, range, or all pages by default)
-- Extract only highlight annotations and their notes (`--highlight`)
-- Write to stdout (for piping) or a file (`--output`)
-- Designed for low-latency LLM workflows (fast “peek” into large PDFs)
+LLMs are often slow when they must open and synthesize full PDFs. This CLI gives a faster path:
 
-## Prerequisites
+- Extract only what you need (`--abstract`, `--highlight`, page/range)
+- Avoid heavy image payloads by default
+- Prefer plain text output for fast agent throughput (default `--mode text`)
 
-- Rust and Cargo installed (`rustup` recommended)
+## Modalities
 
-## Installation
+- `full text/pages`: extract one page, a range, or all pages (default if no page flags)
+- `abstract`: extract only the abstract block for paper triage
+- `highlight`: extract only PDF highlights and their notes
 
-### Option 1: Build and run locally
+## Extraction Modes
+
+For non-highlight extraction, choose with `--mode`:
+
+- `text` (default): plain text, usually fastest for agents
+- `markdown`: preserves heading/list structure when available
+- `auto`: tries markdown first, then falls back to text if quality looks poor
+
+Spacing normalization is enabled by default to reduce merged-word artifacts. Disable with `--no-normalize-spacing`.
+
+## Install
+
+### Local build/run
 
 ```bash
 cargo run -- <PDF_PATH> --page 0
 ```
 
-### Option 2: Install as a local CLI binary
-
-From the repository root:
+### Install binary locally
 
 ```bash
 cargo install --path .
 ```
 
-Then run:
+Then:
 
 ```bash
 cli-pdf-extract <PDF_PATH> --page 0
@@ -37,46 +48,96 @@ cli-pdf-extract <PDF_PATH> --page 0
 
 ## Usage
 
-### Show help
+### Help
 
 ```bash
 cli-pdf-extract --help
 ```
 
-### Single page extraction
+### Single page
 
 ```bash
-cli-pdf-extract examples/main.pdf --page 0 --output extract.md
+cli-pdf-extract examples/main.pdf --page 0
 ```
 
-### Page range extraction (inclusive)
+### Page range (inclusive)
 
 ```bash
-cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5 --output extract.md
+cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5
 ```
 
-### Extract highlights only (fastest LLM pass)
+### All pages (default behavior)
+
+```bash
+cli-pdf-extract examples/main.pdf
+```
+
+### Abstract-only
+
+```bash
+cli-pdf-extract examples/main.pdf --abstract
+```
+
+### Highlights + notes only
 
 ```bash
 cli-pdf-extract examples/main.pdf --highlight
 ```
 
-### Pipe directly to another command / LLM tool
+### Force markdown mode
 
 ```bash
-cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5 | cat
+cli-pdf-extract examples/main.pdf --mode markdown
+```
+
+### Auto fallback mode
+
+```bash
+cli-pdf-extract examples/main.pdf --mode auto
+```
+
+### Write to file
+
+```bash
+cli-pdf-extract examples/main.pdf --abstract --output abstract.txt
+```
+
+## Recommended Presets
+
+### Paper triage (fast)
+
+```bash
+cli-pdf-extract paper.pdf --abstract
+```
+
+### Quick skim with structure
+
+```bash
+cli-pdf-extract paper.pdf --mode markdown --start-page 0 --end-page 2
+```
+
+### Robust default for noisy PDFs
+
+```bash
+cli-pdf-extract paper.pdf --mode auto --start-page 0 --end-page 5
+```
+
+### Annotation mining workflow
+
+```bash
+cli-pdf-extract paper.pdf --highlight
 ```
 
 ## Notes
 
-- Pages are zero-indexed.
-- `--start-page` and `--end-page` must be provided together.
-- `--page` cannot be combined with range flags.
-- Pro-tip: add standardized tags to annotation notes (e.g., `<problem-simulations>`, `<paper-idea>`) to enable downstream clustering, trend discovery, and routing.
+- Page indices are zero-based.
+- `--start-page` and `--end-page` must be used together.
+- `--abstract` cannot be combined with page/range/all or `--highlight`.
+- Pro-tip: add standardized tags to annotation notes (e.g., `<paper-idea>`, `<method>`, `<limitation>`) for downstream clustering and trend discovery.
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See `LICENSE`.
 
 ## Author
 
