@@ -1,12 +1,13 @@
 # cli-pdf-extract
 
-A small Rust CLI to extract PDF pages as Markdown for LLM workflows.
+A fast Rust CLI wrapper around `pdf_oxide` that lets LLMs peek into PDFs without paying the cost of loading and synthesizing whole documents. It extracts page text as Markdown for quick ingestion and can also pull only highlights (plus notes), which is ideal when you want the essence without the full context and need higher LLM throughput.
 
 ## Features
 
-- Extract a single page to Markdown
-- Extract a page range (`--start-page` to `--end-page`)
+- Extract pages as Markdown (single page, range, or all pages by default)
+- Extract only highlight annotations and their notes (`--highlight`)
 - Write to stdout (for piping) or a file (`--output`)
+- Designed for low-latency LLM workflows (fast “peek” into large PDFs)
 
 ## Prerequisites
 
@@ -54,6 +55,12 @@ cli-pdf-extract examples/main.pdf --page 0 --output extract.md
 cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5 --output extract.md
 ```
 
+### Extract highlights only (fastest LLM pass)
+
+```bash
+cli-pdf-extract examples/main.pdf --highlight
+```
+
 ### Pipe directly to another command / LLM tool
 
 ```bash
@@ -65,6 +72,7 @@ cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5 | cat
 - Pages are zero-indexed.
 - `--start-page` and `--end-page` must be provided together.
 - `--page` cannot be combined with range flags.
+- Pro-tip: add standardized tags to annotation notes (e.g., `<problem-simulations>`, `<paper-idea>`) to enable downstream clustering, trend discovery, and routing.
 
 ## License
 
