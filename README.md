@@ -77,3 +77,7 @@ cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5 | cat
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Author
+
+Edgar Torres (edgar.torres@ki.uni-stuttgart.de)

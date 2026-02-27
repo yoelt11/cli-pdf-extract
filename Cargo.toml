@@ -3,6 +3,7 @@ name = "cli-pdf-extract"
 version = "0.1.1"
 edition = "2024"
 license = "MIT"
+authors = ["Edgar Torres <edgar.torres@ki.uni-stuttgart.de>"]
 
 [dependencies]
 anyhow = "1"
