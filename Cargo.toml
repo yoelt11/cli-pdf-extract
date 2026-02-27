@@ -4,6 +4,11 @@ version = "0.1.1"
 edition = "2024"
 license = "MIT"
 authors = ["Edgar Torres <edgar.torres@ki.uni-stuttgart.de>"]
+description = "Fast Rust CLI wrapper around pdf_oxide for LLM-friendly PDF extraction"
+repository = "https://github.com/yoelt11/cli-pdf-extract"
+readme = "README.md"
+keywords = ["pdf", "cli", "llm", "markdown", "annotations"]
+categories = ["command-line-utilities", "text-processing"]
 
 [dependencies]
 anyhow = "1"
