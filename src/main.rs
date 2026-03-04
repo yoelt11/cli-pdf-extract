@@ -1,11 +1,15 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{Context, bail};
 use clap::{ArgAction, Parser, ValueEnum};
+use pdf_oxide::extractors::XmpExtractor;
 use pdf_oxide::converters::ConversionOptions;
 use pdf_oxide::geometry::Rect;
 use pdf_oxide::layout::TextSpan;
 use pdf_oxide::{Annotation, AnnotationSubtype, PdfDocument};
+use serde_json::json;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -14,8 +18,9 @@ use pdf_oxide::{Annotation, AnnotationSubtype, PdfDocument};
     about = "Extract a PDF page as Markdown for LLM ingestion"
 )]
 struct Cli {
-    /// Path to the input PDF file
-    input: PathBuf,
+    /// Path(s) to input PDF file(s)
+    #[arg(required = true, num_args = 1..)]
+    input: Vec<PathBuf>,
 
     /// Zero-based page index to extract (single-page mode)
     #[arg(short, long, conflicts_with_all = ["start_page", "end_page", "all"])]
@@ -29,13 +34,52 @@ struct Cli {
     #[arg(long, requires = "start_page", conflicts_with_all = ["page", "all"])]
     end_page: Option<usize>,
 
+    /// Extract the last N pages
+    #[arg(long, conflicts_with_all = ["page", "start_page", "end_page", "all", "abstract_only"])]
+    last_pages: Option<usize>,
+
     /// Optional output path; if omitted, writes markdown to stdout
-    #[arg(short, long)]
+    #[arg(short, long, conflicts_with = "output_dir")]
     output: Option<PathBuf>,
+
+    /// Output directory for batch processing (writes one file per PDF)
+    #[arg(long, conflicts_with = "output")]
+    output_dir: Option<PathBuf>,
 
     /// Extract all pages (default when no page/range is provided)
     #[arg(long)]
     all: bool,
+
+    /// Extract a named section (e.g., "conclusion")
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "page",
+            "start_page",
+            "end_page",
+            "last_pages",
+            "all",
+            "highlight",
+            "abstract_only",
+            "metadata"
+        ]
+    )]
+    section: Option<String>,
+
+    /// Extract document metadata (title, authors, year, page_count)
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "page",
+            "start_page",
+            "end_page",
+            "last_pages",
+            "all",
+            "highlight",
+            "abstract_only"
+        ]
+    )]
+    metadata: bool,
 
     /// Extract highlight annotations and their notes instead of full text
     #[arg(long, conflicts_with = "abstract_only")]
@@ -56,6 +100,14 @@ struct Cli {
     /// Disable spacing normalization for extracted text
     #[arg(long = "no-normalize-spacing", action = ArgAction::SetFalse, default_value_t = true)]
     normalize_spacing: bool,
+
+    /// Number of worker threads for batch processing
+    #[arg(long, default_value_t = 1)]
+    parallel: usize,
+
+    /// Output format (json currently supported for --metadata mode)
+    #[arg(long, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -65,25 +117,205 @@ enum ExtractMode {
     Text,
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Cli::parse();
 
-    let mut doc = PdfDocument::open(&args.input)
-        .with_context(|| format!("failed to open PDF: {}", args.input.display()))?;
+    if args.parallel == 0 {
+        bail!("--parallel must be at least 1");
+    }
 
-    if args.abstract_only {
-        let abstract_text = extract_abstract(&mut doc, args.mode, args.normalize_spacing)?;
-        if let Some(output_path) = args.output {
-            std::fs::write(&output_path, abstract_text)
-                .with_context(|| format!("failed to write output: {}", output_path.display()))?;
-        } else {
-            print!("{abstract_text}");
+    if args.format == OutputFormat::Json && !args.metadata {
+        bail!("--format json is currently supported only with --metadata");
+    }
+
+    let consolidated_metadata_json =
+        args.input.len() > 1 && args.output.is_some() && args.metadata && args.format == OutputFormat::Json;
+    if args.input.len() > 1 && args.output.is_some() && !consolidated_metadata_json {
+        bail!("--output supports only a single input; use --output-dir for batch processing");
+    }
+
+    if let Some(output_dir) = &args.output_dir {
+        std::fs::create_dir_all(output_dir).with_context(|| {
+            format!(
+                "failed to create output directory: {}",
+                output_dir.display()
+            )
+        })?;
+    }
+
+    let settings = RunSettings {
+        page: args.page,
+        start_page: args.start_page,
+        end_page: args.end_page,
+        last_pages: args.last_pages,
+        all: args.all,
+        metadata_only: args.metadata,
+        section: args.section.clone(),
+        highlight: args.highlight,
+        abstract_only: args.abstract_only,
+        mode: args.mode,
+        normalize_spacing: args.normalize_spacing,
+        format: args.format,
+    };
+
+    let results: Vec<(PathBuf, anyhow::Result<String>)> = if args.parallel > 1 && args.input.len() > 1 {
+        process_inputs_parallel(args.input.clone(), settings.clone(), args.parallel)?
+    } else {
+        let mut out = Vec::with_capacity(args.input.len());
+        for path in &args.input {
+            out.push((path.clone(), process_input(path.clone(), &settings)));
+        }
+        out
+    };
+
+    if let Some(output_path) = args.output {
+        let total = results.len();
+        if settings.metadata_only && settings.format == OutputFormat::Json && total > 1 {
+            let mut arr = Vec::new();
+            let mut failures = Vec::new();
+            for (input, text_result) in results {
+                match text_result {
+                    Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                        Ok(v) => arr.push(v),
+                        Err(err) => failures.push((
+                            input,
+                            format!("failed to parse metadata json for consolidation: {err}"),
+                        )),
+                    },
+                    Err(err) => failures.push((input, err.to_string())),
+                }
+            }
+            std::fs::write(
+                &output_path,
+                serde_json::to_string_pretty(&serde_json::Value::Array(arr))?,
+            )
+            .with_context(|| format!("failed to write output: {}", output_path.display()))?;
+
+            if !failures.is_empty() {
+                for (path, err) in &failures {
+                    eprintln!("warning: {}: {}", path.display(), err);
+                }
+                bail!(
+                    "wrote consolidated json with partial failures: {} of {} file(s) failed",
+                    failures.len(),
+                    total
+                );
+            }
+            return Ok(());
+        }
+
+        let text = results[0]
+            .1
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+        std::fs::write(&output_path, text)
+            .with_context(|| format!("failed to write output: {}", output_path.display()))?;
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+
+    if let Some(output_dir) = args.output_dir {
+        let total = results.len();
+        for (input, text_result) in results {
+            match text_result {
+                Ok(text) => {
+                    let filename = output_filename_for(&input, &settings);
+                    let output_path = output_dir.join(filename);
+                    std::fs::write(&output_path, text).with_context(|| {
+                        format!("failed to write output: {}", output_path.display())
+                    })?;
+                }
+                Err(err) => failures.push((input, err.to_string())),
+            }
+        }
+        if !failures.is_empty() {
+            for (path, err) in &failures {
+                eprintln!("warning: {}: {}", path.display(), err);
+            }
+            bail!(
+                "processed with partial failures: {} of {} file(s) failed",
+                failures.len(),
+                total
+            );
         }
         return Ok(());
     }
 
-    let pages: Vec<usize> = match (args.start_page, args.end_page) {
-        (Some(start), Some(end)) => {
+    let total = results.len();
+    for (idx, (input, text_result)) in results.iter().enumerate() {
+        if total > 1 {
+            if idx > 0 {
+                println!();
+            }
+            println!("=== FILE: {} ===", input.display());
+        }
+        match text_result {
+            Ok(text) => print!("{text}"),
+            Err(err) => {
+                eprintln!("warning: {}: {}", input.display(), err);
+                failures.push((input.clone(), err.to_string()));
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        bail!(
+            "processed with partial failures: {} of {} file(s) failed",
+            failures.len(),
+            total
+        );
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+struct RunSettings {
+    page: Option<usize>,
+    start_page: Option<usize>,
+    end_page: Option<usize>,
+    last_pages: Option<usize>,
+    all: bool,
+    metadata_only: bool,
+    section: Option<String>,
+    highlight: bool,
+    abstract_only: bool,
+    mode: ExtractMode,
+    normalize_spacing: bool,
+    format: OutputFormat,
+}
+
+fn process_input(input: PathBuf, settings: &RunSettings) -> anyhow::Result<String> {
+    let mut doc = PdfDocument::open(&input)
+        .with_context(|| format!("failed to open PDF: {}", input.display()))?;
+
+    if settings.metadata_only {
+        return extract_metadata(&mut doc, &input, settings.format);
+    }
+
+    if let Some(section) = &settings.section {
+        return extract_section(&mut doc, section, settings.mode, settings.normalize_spacing);
+    }
+
+    if settings.abstract_only {
+        return extract_abstract(&mut doc, settings.mode, settings.normalize_spacing);
+    }
+
+    if let Some(last) = settings.last_pages {
+        if last == 0 {
+            bail!("--last-pages must be at least 1");
+        }
+    }
+
+    let pages: Vec<usize> = match (settings.start_page, settings.end_page, settings.last_pages) {
+        (Some(start), Some(end), None) => {
             if start > end {
                 bail!(
                     "invalid range: --start-page ({start}) cannot be greater than --end-page ({end})"
@@ -91,8 +323,13 @@ fn main() -> anyhow::Result<()> {
             }
             (start..=end).collect()
         }
-        (None, None) => {
-            if let Some(page) = args.page {
+        (None, None, Some(last)) => {
+            let page_count = doc.page_count()?;
+            let start = page_count.saturating_sub(last);
+            (start..page_count).collect()
+        }
+        (None, None, None) => {
+            if let Some(page) = settings.page {
                 vec![page]
             } else {
                 let page_count = doc.page_count()?;
@@ -102,17 +339,21 @@ fn main() -> anyhow::Result<()> {
         _ => bail!("both --start-page and --end-page must be provided together"),
     };
 
-    if args.all && args.page.is_none() && args.start_page.is_none() && args.end_page.is_none() {
+    if settings.all
+        && settings.page.is_none()
+        && settings.start_page.is_none()
+        && settings.end_page.is_none()
+    {
         // --all is the explicit version of the default behavior.
     }
 
     let mut markdown = String::new();
     for page in pages {
-        let page_text = if args.highlight {
+        let page_text = if settings.highlight {
             extract_highlights(&mut doc, page)
                 .with_context(|| format!("failed to extract highlights for page {page}"))?
         } else {
-            extract_page_text(&mut doc, page, args.mode, args.normalize_spacing)
+            extract_page_text(&mut doc, page, settings.mode, settings.normalize_spacing)
                 .with_context(|| format!("failed to extract page {page}"))?
         };
 
@@ -127,14 +368,505 @@ fn main() -> anyhow::Result<()> {
         markdown.push_str(&page_text);
     }
 
-    if let Some(output_path) = args.output {
-        std::fs::write(&output_path, markdown)
-            .with_context(|| format!("failed to write output: {}", output_path.display()))?;
-    } else {
-        print!("{markdown}");
+    Ok(markdown)
+}
+
+fn output_filename_for(input: &std::path::Path, settings: &RunSettings) -> String {
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output");
+    if settings.highlight {
+        return format!("{stem}_highlights.txt");
+    }
+    if settings.abstract_only {
+        return format!("{stem}_abstract.txt");
+    }
+    if settings.metadata_only {
+        return match settings.format {
+            OutputFormat::Text => format!("{stem}_metadata.txt"),
+            OutputFormat::Json => format!("{stem}_metadata.json"),
+        };
+    }
+    if let Some(section) = &settings.section {
+        let name = section
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>();
+        return format!("{stem}_{name}.txt");
+    }
+    format!("{stem}.md")
+}
+
+fn extract_metadata(
+    doc: &mut PdfDocument,
+    input: &std::path::Path,
+    format: OutputFormat,
+) -> anyhow::Result<String> {
+    let page_count = doc.page_count()?;
+    let xmp = XmpExtractor::extract(doc).ok().flatten();
+
+    let mut title = xmp.as_ref().and_then(|m| m.dc_title.clone());
+    let mut authors = xmp
+        .as_ref()
+        .map(|m| normalize_authors(&m.dc_creator))
+        .unwrap_or_default();
+    let mut year = xmp
+        .as_ref()
+        .and_then(|m| {
+            m.xmp_create_date
+                .as_deref()
+                .or(m.xmp_modify_date.as_deref())
+                .and_then(extract_year)
+        });
+
+    // Fallback title: first non-empty heading/text line from page 0.
+    if title.is_none() {
+        if let Ok(first_page) = doc.extract_text(0) {
+            title = first_page
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty() && l.len() > 8)
+                .map(str::to_string);
+        }
     }
 
-    Ok(())
+    if let Ok(first_page) = doc.extract_text(0) {
+        if authors.is_empty() {
+            authors = extract_authors_from_first_page(&first_page);
+        }
+        // Fallback year from first page text.
+        if year.is_none() {
+            year = extract_year(&first_page);
+        }
+    }
+
+    if authors.is_empty() {
+        authors.push("unknown".to_string());
+    }
+
+    let filename = input
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown.pdf");
+
+    let title = title.unwrap_or_else(|| "unknown".to_string());
+    let year = year.unwrap_or_else(|| "unknown".to_string());
+
+    match format {
+        OutputFormat::Text => Ok(format!(
+            "file: {filename}\ntitle: {title}\nauthors: {}\nyear: {year}\npage_count: {page_count}\n",
+            authors.join(", ")
+        )),
+        OutputFormat::Json => Ok(
+            json!({
+                "file": filename,
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "page_count": page_count
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn extract_year(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 4 {
+        let window = &bytes[i..i + 4];
+        if window.iter().all(|b| b.is_ascii_digit()) {
+            let year = std::str::from_utf8(window).ok()?;
+            if (1900..=2100).contains(&year.parse::<u32>().ok()?) {
+                return Some(year.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn extract_section(
+    doc: &mut PdfDocument,
+    section: &str,
+    mode: ExtractMode,
+    normalize_spacing: bool,
+) -> anyhow::Result<String> {
+    let targets = section_targets(section);
+    if let Some(found) = scan_section(doc, &targets, mode, normalize_spacing, false)? {
+        return Ok(found);
+    }
+
+    // Relaxed fallback for conclusion-like sections: search for lines containing
+    // the keyword even when heading formatting is noisy.
+    if targets.iter().any(|t| t.contains("conclusion")) {
+        if let Some(found) = scan_section(doc, &targets, mode, normalize_spacing, true)? {
+            return Ok(found);
+        }
+    }
+
+    if let Some(found) = scan_section_full_text(doc, &targets, mode, normalize_spacing)? {
+        return Ok(found);
+    }
+
+    bail!("could not locate section: {section} (try --section discussion)");
+}
+
+fn scan_section(
+    doc: &mut PdfDocument,
+    targets: &[String],
+    mode: ExtractMode,
+    normalize_spacing: bool,
+    relaxed: bool,
+) -> anyhow::Result<Option<String>> {
+    let page_count = doc.page_count()?;
+    let section_mode = if mode == ExtractMode::Text {
+        ExtractMode::Markdown
+    } else {
+        mode
+    };
+    let mut collecting = false;
+    let mut collected = String::new();
+
+    for page in 0..page_count {
+        let page_text = extract_page_text(doc, page, section_mode, normalize_spacing)?;
+        for line in page_text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                if collecting {
+                    collected.push('\n');
+                }
+                continue;
+            }
+
+            let marker = normalize_marker(trimmed);
+            if !collecting {
+                let match_found = if relaxed {
+                    is_heading_like(trimmed) && contains_section_keyword(trimmed, &marker, targets)
+                } else {
+                    is_section_heading_match(&marker, targets)
+                };
+                if match_found {
+                    collecting = true;
+                    continue;
+                }
+            } else if is_heading_like(trimmed) && !is_section_heading_match(&marker, targets) {
+                if marker.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                if !collected.trim().is_empty() {
+                    if collected.trim().len() > 120 {
+                        return Ok(Some(collected.trim().to_string()));
+                    }
+                    collecting = false;
+                    collected.clear();
+                }
+            }
+
+            if collecting {
+                collected.push_str(trimmed);
+                collected.push('\n');
+            }
+        }
+    }
+
+    if collected.trim().is_empty() || collected.trim().len() <= 120 {
+        return Ok(None);
+    }
+    Ok(Some(collected.trim().to_string()))
+}
+
+fn section_targets(section: &str) -> Vec<String> {
+    let target = normalize_marker(section);
+    if target == "conclusion" || target == "conclusions" {
+        return vec![
+            "conclusion".to_string(),
+            "conclusions".to_string(),
+            "conclusionandfuturework".to_string(),
+            "conclusionsandfuturework".to_string(),
+            "discussionandconclusion".to_string(),
+            "summaryandconclusion".to_string(),
+            "concludingremarks".to_string(),
+            "finalremarks".to_string(),
+            "closingremarks".to_string(),
+            "discussion".to_string(),
+            "limitations".to_string(),
+            "limitationsandtradeoffs".to_string(),
+            "tradeoffs".to_string(),
+        ];
+    }
+    vec![target]
+}
+
+fn is_section_heading_match(marker: &str, targets: &[String]) -> bool {
+    if targets.iter().any(|t| marker == t) {
+        return true;
+    }
+    for target in targets {
+        if marker.ends_with(target) {
+            let prefix = &marker[..marker.len().saturating_sub(target.len())];
+            if prefix.is_empty()
+                || prefix.chars().all(|c| c.is_ascii_digit())
+                || prefix == "section"
+                || prefix == "appendix"
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_heading_like(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.starts_with('#') {
+        return true;
+    }
+    if trimmed.len() > 120 {
+        return false;
+    }
+    let words = trimmed.split_whitespace().count();
+    if words > 14 {
+        return false;
+    }
+    let norm = normalize_marker(trimmed);
+    if norm.is_empty() {
+        return false;
+    }
+    let has_digits_prefix = norm
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .count()
+        > 0;
+    let all_caps_words = trimmed
+        .split_whitespace()
+        .filter(|w| w.chars().any(|c| c.is_ascii_alphabetic()))
+        .all(|w| w.chars().all(|c| !c.is_ascii_lowercase()));
+    has_digits_prefix || all_caps_words
+}
+
+fn contains_section_keyword(line: &str, marker: &str, targets: &[String]) -> bool {
+    let line_words = line.split_whitespace().count();
+    if line_words > 18 {
+        return false;
+    }
+    targets.iter().any(|target| {
+        marker.contains(target)
+            || line
+                .to_ascii_lowercase()
+                .split_whitespace()
+                .any(|w| w.contains(target))
+    })
+}
+
+fn scan_section_full_text(
+    doc: &mut PdfDocument,
+    targets: &[String],
+    mode: ExtractMode,
+    normalize_spacing: bool,
+) -> anyhow::Result<Option<String>> {
+    let page_count = doc.page_count()?;
+    let section_mode = if mode == ExtractMode::Text {
+        ExtractMode::Markdown
+    } else {
+        mode
+    };
+
+    let mut lines = Vec::new();
+    for page in 0..page_count {
+        let page_text = extract_page_text(doc, page, section_mode, normalize_spacing)?;
+        lines.extend(page_text.lines().map(str::to_string));
+    }
+
+    let mut start = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let marker = normalize_marker(line);
+        if is_section_heading_match(&marker, targets)
+            || (is_heading_like(line) && contains_section_keyword(line, &marker, targets))
+        {
+            start = Some(idx + 1);
+            break;
+        }
+    }
+    let Some(start_idx) = start else {
+        return Ok(None);
+    };
+
+    let mut out = String::new();
+    for line in lines.iter().skip(start_idx) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            continue;
+        }
+
+        let marker = normalize_marker(trimmed);
+        if is_heading_like(trimmed) && !is_section_heading_match(&marker, targets) {
+            if marker.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            break;
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+
+    if out.trim().len() <= 120 {
+        return Ok(None);
+    }
+    Ok(Some(out.trim().to_string()))
+}
+
+fn normalize_authors(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for entry in raw {
+        let cleaned = entry.replace(['\n', '\r'], " ");
+        for part in cleaned
+            .split(&[',', ';'][..])
+            .flat_map(|p| p.split(" and "))
+            .map(str::trim)
+        {
+            let name = sanitize_author_name(part);
+            if !name.is_empty() && looks_like_person_name(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out.dedup();
+    out
+}
+
+fn extract_authors_from_first_page(page_text: &str) -> Vec<String> {
+    let mut lines: Vec<&str> = page_text.lines().map(str::trim).collect();
+    lines.retain(|l| !l.is_empty());
+
+    let abstract_idx = lines
+        .iter()
+        .position(|l| normalize_marker(l).starts_with("abstract"))
+        .unwrap_or(lines.len().min(30));
+    let search_space = &lines[..abstract_idx.min(lines.len())];
+
+    // Prefer lines with commas/and likely listing multiple names.
+    for line in search_space.iter().rev() {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("university")
+            || lower.contains("department")
+            || lower.contains("institute")
+            || lower.contains("arxiv")
+            || lower.contains('@')
+        {
+            continue;
+        }
+        if !(line.contains(',') || lower.contains(" and ")) {
+            continue;
+        }
+
+        let candidates = line
+            .split(&[',', ';'][..])
+            .flat_map(|p| p.split(" and "))
+            .map(str::trim)
+            .map(sanitize_author_name)
+            .filter(|s| !s.is_empty() && looks_like_person_name(s))
+            .collect::<Vec<_>>();
+        if !candidates.is_empty() {
+            return dedup_vec(candidates);
+        }
+    }
+
+    Vec::new()
+}
+
+fn sanitize_author_name(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphabetic() || *c == ' ' || *c == '-' || *c == '\'')
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn looks_like_person_name(s: &str) -> bool {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 2 || parts.len() > 5 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|p| p.chars().next().map(|c| c.is_uppercase()).unwrap_or(false))
+}
+
+fn dedup_vec(v: Vec<String>) -> Vec<String> {
+    let mut out = Vec::new();
+    for item in v {
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
+    out
+}
+
+fn process_inputs_parallel(
+    inputs: Vec<PathBuf>,
+    settings: RunSettings,
+    workers: usize,
+) -> anyhow::Result<Vec<(PathBuf, anyhow::Result<String>)>> {
+    let queue = Arc::new(Mutex::new(
+        inputs
+            .into_iter()
+            .enumerate()
+            .collect::<std::collections::VecDeque<(usize, PathBuf)>>(),
+    ));
+    let queue_len = queue.lock().expect("queue mutex poisoned").len();
+    let mut slots = Vec::with_capacity(queue_len);
+    slots.resize_with(queue_len, || None);
+    let results = Arc::new(Mutex::new(slots));
+    let mut handles = Vec::new();
+
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let results = Arc::clone(&results);
+        let settings = settings.clone();
+        handles.push(thread::spawn(move || {
+            loop {
+                let next = {
+                    let mut q = queue.lock().expect("queue mutex poisoned");
+                    q.pop_front()
+                };
+                let Some((idx, path)) = next else {
+                    break;
+                };
+                let result = process_input(path.clone(), &settings);
+                let mut out = results.lock().expect("results mutex poisoned");
+                out[idx] = Some((path, result));
+            }
+        }));
+    }
+
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("worker thread panicked"))?;
+    }
+
+    let mut ordered = Vec::new();
+    let mut locked = results.lock().expect("results mutex poisoned");
+    for slot in locked.drain(..) {
+        let Some(res) = slot else {
+            bail!("internal error: missing batch result");
+        };
+        ordered.push(res);
+    }
+    Ok(ordered)
 }
 
 fn extract_abstract(

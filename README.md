@@ -15,6 +15,8 @@ LLMs are often slow when they must open and synthesize full PDFs. This CLI gives
 - `full text/pages`: extract one page, a range, or all pages (default if no page flags)
 - `abstract`: extract only the abstract block for paper triage
 - `highlight`: extract only PDF highlights and their notes
+- `metadata`: extract `title`, `authors`, `year`, `page_count`
+- `section`: extract a specific section by name (e.g., `--section conclusion`)
 
 ## Extraction Modes
 
@@ -66,6 +68,12 @@ cli-pdf-extract examples/main.pdf --page 0
 cli-pdf-extract examples/main.pdf --start-page 0 --end-page 5
 ```
 
+### Last N pages
+
+```bash
+cli-pdf-extract examples/main.pdf --last-pages 3
+```
+
 ### All pages (default behavior)
 
 ```bash
@@ -84,6 +92,30 @@ cli-pdf-extract examples/main.pdf --abstract
 cli-pdf-extract examples/main.pdf --highlight
 ```
 
+### Batch abstract extraction to a directory
+
+```bash
+cli-pdf-extract papers/*.pdf --abstract --output-dir ./output/
+```
+
+### Metadata extraction
+
+```bash
+cli-pdf-extract papers/*.pdf --metadata --output-dir ./output/
+```
+
+### Metadata as JSON
+
+```bash
+cli-pdf-extract papers/*.pdf --metadata --format json --output-dir ./output/
+```
+
+### Consolidated metadata JSON (single file)
+
+```bash
+cli-pdf-extract papers/*.pdf --metadata --format json --output papers.json
+```
+
 ### Force markdown mode
 
 ```bash
@@ -94,6 +126,12 @@ cli-pdf-extract examples/main.pdf --mode markdown
 
 ```bash
 cli-pdf-extract examples/main.pdf --mode auto
+```
+
+### Batch with parallel workers
+
+```bash
+cli-pdf-extract papers/*.pdf --abstract --output-dir ./output/ --parallel 4
 ```
 
 ### Write to file
@@ -128,11 +166,31 @@ cli-pdf-extract paper.pdf --mode auto --start-page 0 --end-page 5
 cli-pdf-extract paper.pdf --highlight
 ```
 
+### Collection triage (batch + parallel)
+
+```bash
+cli-pdf-extract papers/*.pdf --abstract --output-dir ./output/ --parallel 4
+```
+
+### Metadata at scale (batch + parallel)
+
+```bash
+cli-pdf-extract papers/*.pdf --metadata --output-dir ./output/ --parallel 4
+```
+
+### Conclusion extraction
+
+```bash
+cli-pdf-extract paper.pdf --section conclusion
+```
+
 ## Notes
 
 - Page indices are zero-based.
 - `--start-page` and `--end-page` must be used together.
+- `--last-pages N` extracts the final `N` pages.
 - `--abstract` cannot be combined with page/range/all or `--highlight`.
+- `--output` is single-input for most modes; exception: with `--metadata --format json`, multiple inputs are consolidated into one JSON array file.
 - Pro-tip: add standardized tags to annotation notes (e.g., `<paper-idea>`, `<method>`, `<limitation>`) for downstream clustering and trend discovery.
 
 ## License
